@@ -141,11 +141,11 @@ else
   echo ""
   echo "ADMIN ($ADMIN_ADDRESS) is separate from DEPLOYER and ADMIN_KEY was not"
   echo "set, so this run has no key that can satisfy initialize()'s"
-  echo "admin.require_auth(). initialize() is callable by anyone, so until the
-  echo "call below lands, anyone watching testnet can call it first with their
-  echo "own address as admin. They would then own set_adapter/set_admin/
-  echo "set_paused on this vault, and the real initialize() would fail with
-  echo "AlreadyInitialized. Run this NOW, or re-run the script with ADMIN_KEY
+  echo "admin.require_auth(). initialize() is callable by anyone, so until the"
+  echo "call below lands, anyone watching testnet can call it first with their"
+  echo "own address as admin. They would then own set_adapter/set_admin/"
+  echo "set_paused on this vault, and the real initialize() would fail with"
+  echo "AlreadyInitialized. Run this NOW, or re-run the script with ADMIN_KEY"
   echo "set and abandon this vault:"
   echo ""
   echo "  stellar contract invoke --network $NETWORK --source <your-ADMIN-key-or-alias> \"

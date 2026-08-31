@@ -50,7 +50,11 @@ protocol from what's actually available on-chain:
   the same weekly-compounded rate estimate Blend's own indexer and UI
   compute, via `Reserve.setRates()`. This avoids a second, hand-rolled copy
   of that formula that could silently drift from Blend's actual deployed
-  behavior.
+  behavior. The reserve it prices is the vault's own asset, threaded through
+  each `RateQuery` from the vault's `KNOWN_POOLS` entry (`assetId`, see
+  `known-pools.ts`), falling back to the network's USDC address for a vault
+  without one — so a EURC pool prices its EURC reserve, not the USDC one
+  (#539).
 - **DeFindex**: `DefindexAdapter` exposes `get_asset_amounts_per_shares()`, a
   live share-price snapshot with no rate on its own — a rate needs a second
   sample separated in time. `createDefindexRateSource` takes a fresh
@@ -102,7 +106,7 @@ This is deliberately **not** the same key as `MERIDIAN_KEEPER_SECRET_KEY`
 (the accrue keeper's key). `accrue()` is permissionless, any account can call
 it. `migrate_adapter` is admin-gated (`Self::require_admin`), so this key
 must be the vault's actual admin address and carries full vault admin
-authority: `migrate_adapter`, `set_adapter`, `set_paused`, `set_admin`.
+authority: `migrate_adapter`, `set_adapter`, `set_paused`, `transfer_admin`.
 Compromising this key is equivalent to compromising the vault admin
 directly. Keep it separately stored, separately rotatable, and scoped to
 only the systems that need it, unlike the accrue keeper's key, this is not a
