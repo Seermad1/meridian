@@ -2,8 +2,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short,
-    token::{self, TokenClient},
-    Address, Env, Symbol,
+    token::TokenClient, Address, Env, Symbol,
 };
 
 // ---------------------------------------------------------------------------
@@ -40,6 +39,10 @@ pub trait YieldAdapterInterface {
     fn deposit(env: Env, amount: i128) -> i128;
     fn withdraw(env: Env, shares: i128, recipient: Address) -> i128;
     fn total_assets(env: Env) -> i128;
+    /// The adapter's current protocol-share balance, read from the underlying
+    /// protocol's own ledger rather than self-tracked. Lets the vault reconcile
+    /// ADPT_SH instead of estimating its decrements.
+    fn total_shares(env: Env) -> i128;
     /// Refreshes the adapter's cached total_assets before it is read for
     /// deposit/withdraw pricing. A no-op for adapters that already price
     /// live on every call.
@@ -57,6 +60,30 @@ pub trait YieldAdapterInterface {
     /// interpret the address returned by `get_pool()`, without a manually
     /// maintained config mapping that could drift out of sync.
     fn get_protocol(env: Env) -> Symbol;
+}
+
+// ---------------------------------------------------------------------------
+// mUSDC admin interface (#578)
+// ---------------------------------------------------------------------------
+
+/// The subset of the mUSDC token's admin-only surface the vault calls into.
+/// Kept minimal and local to this crate, mirroring `YieldAdapterInterface`
+/// above: the vault never depends on `meridian-musdc-token` directly, in
+/// production or in tests — `MockMusdc` in the test module below stands in
+/// for it the same way `MockAdapter` stands in for a real adapter crate
+/// (see `MockMusdc`'s doc comment for why: a real cross-crate dependency
+/// between the two hits a Windows-toolchain-specific linker limit in this
+/// environment). `MusdcAdminClient`/`TokenClient` dispatch to whatever
+/// contract implements matching function names and argument encodings, not
+/// to a specific Rust type, so `MockMusdc` is a valid call target for both
+/// without implementing this trait. No `Result` return, matching
+/// `YieldAdapterInterface`'s methods: `deposit`'s own `shares_to_mint <= 0`
+/// check already guarantees `mint` is never called with a non-positive
+/// amount, so the only realistic failure is an auth mismatch, which panics
+/// through from the token side regardless of this trait's signature.
+#[contractclient(name = "MusdcAdminClient")]
+pub trait MusdcAdminInterface {
+    fn mint(env: Env, to: Address, amount: i128);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +137,11 @@ pub enum ContractError {
     WithdrawalTooSmall = 8,
     /// An intermediate arithmetic operation would overflow `i128`.
     Overflow = 9,
-    /// `set_adapter` was called while the vault still has shares outstanding.
+    /// `set_adapter` was called while the vault still has shares outstanding
+    /// (`TOTAL_SH > 0`) or the old adapter still holds a position
+    /// (`ADPT_SH > 0`). The two counters can desync (see `migrate_adapter`'s
+    /// `NoAdapterPosition` doc), so both are checked: `TOTAL_SH` alone is not
+    /// sufficient evidence that the old adapter is actually empty.
     AdapterSwapUnsafe = 10,
     /// `migrate_adapter` was called with the vault's current adapter as the
     /// target.
@@ -195,7 +226,6 @@ impl MeridianVault {
             .get(&ADAPTER)
             .ok_or(ContractError::NotInitialized)?;
         let total_shares: i128 = env.storage().instance().get(&TOTAL_SH).unwrap_or(0);
-        let total_adapter_shares: i128 = env.storage().instance().get(&ADPT_SH).unwrap_or(0);
 
         // Refresh the adapter's cached total before pricing so this
         // depositor's own transaction is priced with up-to-date yield.
@@ -232,13 +262,13 @@ impl MeridianVault {
         }
 
         // A caller who currently holds no shares but still has Entry/Principal
-        // records is one who fully transferred a prior position away: the
-        // vault has no hook on mUSDC's built-in `transfer`, so those records
-        // were never cleared the way a full `withdraw()` clears them (see
-        // `get_principal`). Left in place, this deposit would be treated as a
-        // top-up onto a stale basis and entry time that belong to shares this
-        // caller no longer holds. Clearing them first makes this the fresh
-        // entry it actually is.
+        // records is a defensive safety net, not the normal path: `on_transfer`
+        // (#578) now clears a sender's records itself the moment a full
+        // transfer-out reaches zero, and `withdraw()`'s full-exit branch
+        // already did the same, so this should be unreachable in the current
+        // system. It stays in place for a balance that reached zero any other
+        // way this contract doesn't yet account for, so a stale basis can
+        // never be silently inherited by a fresh deposit.
         if TokenClient::new(&env, &musdc).balance(&caller) == 0 {
             Self::clear_position_records(&env, &caller);
         }
@@ -249,10 +279,11 @@ impl MeridianVault {
         TokenClient::new(&env, &usdc).transfer(&caller, &adapter_addr, &amount);
 
         // Adapter deploys USDC to the underlying protocol and returns its own shares.
-        let adapter_shares = AdapterClient::new(&env, &adapter_addr).deposit(&amount);
+        let adapter_client = AdapterClient::new(&env, &adapter_addr);
+        let _adapter_shares = adapter_client.deposit(&amount);
 
         // Mint mUSDC shares to caller.
-        token::StellarAssetClient::new(&env, &musdc).mint(&caller, &shares_to_mint);
+        MusdcAdminClient::new(&env, &musdc).mint(&caller, &shares_to_mint);
 
         // Update global share and adapter-share counters.
         env.storage()
@@ -260,7 +291,7 @@ impl MeridianVault {
             .set(&TOTAL_SH, &(total_shares + shares_to_mint));
         env.storage()
             .instance()
-            .set(&ADPT_SH, &(total_adapter_shares + adapter_shares));
+            .set(&ADPT_SH, &adapter_client.total_shares());
 
         // Stamp the entry time on the caller's first deposit; top-ups keep
         // the original time. Keyed off whether an entry record exists rather
@@ -349,8 +380,9 @@ impl MeridianVault {
             .ok_or(ContractError::Overflow)?;
 
         // Adapter redeems protocol shares, delivers USDC to vault, returns amount.
-        let usdc_out = AdapterClient::new(&env, &adapter_addr)
-            .withdraw(&adapter_shares_to_burn, &env.current_contract_address());
+        let adapter_client = AdapterClient::new(&env, &adapter_addr);
+        let usdc_out =
+            adapter_client.withdraw(&adapter_shares_to_burn, &env.current_contract_address());
 
         if usdc_out <= 0 {
             return Err(ContractError::WithdrawalTooSmall);
@@ -373,7 +405,7 @@ impl MeridianVault {
             .set(&TOTAL_SH, &(total_shares - shares));
         env.storage()
             .instance()
-            .set(&ADPT_SH, &(total_adapter_shares - adapter_shares_to_burn));
+            .set(&ADPT_SH, &adapter_client.total_shares());
 
         let remaining = caller_shares - shares;
 
@@ -398,6 +430,150 @@ impl MeridianVault {
         Ok(usdc_out)
     }
 
+    /// Called by the mUSDC token contract immediately after it moves a
+    /// transfer's balances, splitting `Principal`/`Entry` pro-rata between
+    /// sender and receiver (#578) — the fix for the honest-`0` degradation
+    /// documented on `get_principal`/`get_entry_time`, from back when mUSDC
+    /// was a plain Stellar Asset Contract with no hook for the vault to
+    /// observe a transfer at all.
+    ///
+    /// Requires the mUSDC token's own `require_auth()`, which succeeds only
+    /// when mUSDC is the *direct* caller of this exact invocation — Soroban
+    /// treats a contract's own direct sub-calls as inherently authorized by
+    /// that contract, with no signature needed (see
+    /// `Env::authorize_as_current_contract`'s doc comment: "All the direct
+    /// calls that the current contract performs are always considered to
+    /// have been authorized"). This can therefore never be triggered by
+    /// anything other than a genuine transfer on the one real, configured
+    /// mUSDC contract — the same direction-reversed pattern
+    /// `adapter-common::require_vault_auth` already uses for every adapter
+    /// to verify a call actually came from the vault.
+    ///
+    /// `sender_balance_before`/`receiver_balance_before` are `from`'s/`to`'s
+    /// mUSDC balances immediately before this transfer, supplied by the
+    /// token since it already has both on hand from computing the transfer
+    /// itself — see `meridian-musdc-token`'s `VaultCallback` trait doc
+    /// comment (`packages/contracts/musdc-token/src/lib.rs`).
+    pub fn on_transfer(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount: i128,
+        sender_balance_before: i128,
+        receiver_balance_before: i128,
+    ) -> Result<(), ContractError> {
+        let musdc = Self::musdc(&env)?;
+        musdc.require_auth();
+
+        let sender_principal_key = DataKey::Principal(from.clone());
+        let sender_entry_key = DataKey::Entry(from.clone());
+        let receiver_principal_key = DataKey::Principal(to.clone());
+        let receiver_entry_key = DataKey::Entry(to.clone());
+
+        let sender_principal: i128 = env
+            .storage()
+            .persistent()
+            .get(&sender_principal_key)
+            .unwrap_or(0);
+        let sender_entry: u64 = env
+            .storage()
+            .persistent()
+            .get(&sender_entry_key)
+            .unwrap_or(0);
+
+        // Pro-rata share of the sender's cost basis moving with these
+        // shares — the same math proposed on #504.
+        let principal_moved = sender_principal
+            .checked_mul(amount)
+            .ok_or(ContractError::Overflow)?
+            .checked_div(sender_balance_before)
+            .ok_or(ContractError::Overflow)?;
+
+        // Sender side: retire the moved principal. A full transfer-out
+        // clears both records, mirroring withdraw()'s full-exit branch,
+        // rather than leaving a zero-balance holder with a leftover Entry
+        // to self-heal on the next read. A partial transfer-out leaves
+        // Entry untouched, exactly like a partial withdraw(): it already
+        // reflects when the sender first deposited, not what they
+        // currently hold.
+        if sender_balance_before - amount == 0 {
+            Self::clear_position_records(&env, &from);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&sender_principal_key, &(sender_principal - principal_moved));
+        }
+
+        // Receiver side. `receiver_balance_before == 0` is this receiver's
+        // first position — same check `deposit()` uses before treating a
+        // deposit as a top-up, and for the same reason: it may have a stale
+        // Entry/Principal record left behind by an earlier position this
+        // address fully gave up, and inheriting the sender's basis/entry
+        // time outright (rather than averaging against that stale record)
+        // is correct here since overwriting is unconditional.
+        if receiver_balance_before == 0 {
+            env.storage()
+                .persistent()
+                .set(&receiver_principal_key, &principal_moved);
+            env.storage()
+                .persistent()
+                .set(&receiver_entry_key, &sender_entry);
+        } else {
+            let receiver_principal: i128 = env
+                .storage()
+                .persistent()
+                .get(&receiver_principal_key)
+                .unwrap_or(0);
+            let receiver_entry: u64 = env
+                .storage()
+                .persistent()
+                .get(&receiver_entry_key)
+                .unwrap_or(0);
+            let total_principal = receiver_principal
+                .checked_add(principal_moved)
+                .ok_or(ContractError::Overflow)?;
+
+            env.storage()
+                .persistent()
+                .set(&receiver_principal_key, &total_principal);
+
+            // Principal-weighted average of the receiver's existing entry
+            // time and the sender's, so a large incoming transfer
+            // meaningfully pulls entry_time forward instead of the
+            // receiver's own original stamp swallowing the incoming
+            // position wholesale. Unlike the dust-position gaming
+            // constraint noted on `deposit()` (which can't do this because
+            // a plain top-up has no second principal weight to average
+            // against), a transfer-in always carries `principal_moved`
+            // alongside it, so the correct weighted average is always
+            // computable here.
+            let weighted_entry = if total_principal > 0 {
+                let weighted = (receiver_entry as i128)
+                    .checked_mul(receiver_principal)
+                    .ok_or(ContractError::Overflow)?
+                    .checked_add(
+                        (sender_entry as i128)
+                            .checked_mul(principal_moved)
+                            .ok_or(ContractError::Overflow)?,
+                    )
+                    .ok_or(ContractError::Overflow)?
+                    .checked_div(total_principal)
+                    .ok_or(ContractError::Overflow)?;
+                weighted as u64
+            } else {
+                // Both principals are zero (e.g. a dust position with no
+                // recorded basis on either side) — nothing to weight
+                // against, so keep whatever the receiver already had.
+                receiver_entry
+            };
+            env.storage()
+                .persistent()
+                .set(&receiver_entry_key, &weighted_entry);
+        }
+
+        Ok(())
+    }
+
     /// Returns the address's mUSDC share balance, read from the share token
     /// itself. mUSDC received by transfer counts immediately and withdraws
     /// normally, exactly like minted shares; there is no separate vault-side
@@ -417,17 +593,21 @@ impl MeridianVault {
     /// no position. Reset whenever the position is fully withdrawn.
     ///
     /// Entry time belongs to a depositor, not to the shares: it is recorded
-    /// when an address first deposits and is not carried by a transfer (see
-    /// `get_principal` for why). An address holding no mUSDC reports 0 even
-    /// if it deposited earlier and later transferred everything away, so a
-    /// record left behind by a transfer-out is never reported as a live
-    /// position.
+    /// when an address first deposits, and now (#578) is also split
+    /// pro-rata on a transfer by `on_transfer` — see that function's doc
+    /// comment for the split math. An address holding no mUSDC reports 0
+    /// even if it deposited earlier and later transferred everything away,
+    /// so a record left behind by a full transfer-out is never reported as
+    /// a live position.
     ///
-    /// A zero-position holder with a leftover record here means the vault
-    /// never got to observe the transfer that emptied it (only `withdraw()`
-    /// clears eagerly; a plain `transfer()` gives the vault no hook at all).
-    /// This call is the first chance to notice, so it clears the record
-    /// before returning 0, rather than leaving it to resurface as a stale
+    /// `on_transfer` clears a sender's record itself the moment a full
+    /// transfer-out reaches zero, so a leftover record found here should be
+    /// unreachable in the current system; this self-heal is kept as a
+    /// defensive fallback for any balance that reached zero another way
+    /// this contract doesn't yet account for (and for state left behind by
+    /// mUSDC's pre-#578 life as a plain Stellar Asset Contract with no
+    /// transfer hook at all, before a live-holder migration if one hasn't
+    /// run yet). Clearing it here means it can never resurface as a stale
     /// basis/entry time if this address's balance later becomes nonzero
     /// again through an unrelated deposit or transfer-in.
     pub fn get_entry_time(env: Env, address: Address) -> u64 {
@@ -443,26 +623,23 @@ impl MeridianVault {
     /// yet withdrawn. Yield earned is current share value minus this value.
     ///
     /// Cost basis is history, not a holding, so unlike the share balance it
-    /// cannot be derived from the token and does not move with a transfer.
-    /// mUSDC is a Stellar Asset Contract, whose `transfer` is the built-in
-    /// implementation with no hook for the vault to observe, so there is no
-    /// point at which the vault could split a sender's basis and hand part of
-    /// it to a receiver. The consequences are bounded and only affect
-    /// reporting, never the ability to withdraw:
+    /// cannot be derived from the token on its own — but as of #578, mUSDC is
+    /// a custom SEP-41 token the vault controls the code of (not a plain
+    /// Stellar Asset Contract), so its `transfer`/`transfer_from` call back
+    /// into `on_transfer`, which splits a sender's basis and hands the
+    /// pro-rata share to the receiver at the moment of transfer. See
+    /// `on_transfer`'s doc comment for the split math.
     ///
-    /// - An address that received mUSDC by transfer reports `0`, meaning "no
-    ///   recorded basis", so its displayed yield is its full share value.
-    /// - An address that transferred its position away reports `0` here
-    ///   because it holds nothing, rather than a stale basis for shares it no
-    ///   longer has.
+    /// An address that transferred its entire position away reports `0`
+    /// here because it holds nothing, rather than a stale basis for shares
+    /// it no longer has — `on_transfer` clears both records itself the
+    /// moment a full transfer-out reaches zero.
     ///
-    /// Making basis follow a transfer needs a share token the vault controls
-    /// the code of; see `apps/docs/architecture/vault.md`.
-    ///
-    /// Like `get_entry_time`, a zero-position holder found with a leftover
-    /// record here has one only because a plain `transfer()` emptied them
-    /// with no hook for the vault to clear it eagerly. Clears it now so a
-    /// later unrelated deposit or transfer-in can't inherit a stale basis.
+    /// Like `get_entry_time`, the self-heal below (clearing a zero-position
+    /// holder's leftover record) should be unreachable in the current
+    /// system; it's kept as a defensive fallback, and as a bridge for
+    /// records left over from mUSDC's pre-#578 life as a plain SAC before a
+    /// live-holder migration, if one hasn't run yet.
     pub fn get_principal(env: Env, address: Address) -> i128 {
         if Self::get_position(env.clone(), address.clone()) == 0 {
             Self::clear_position_records(&env, &address);
@@ -549,15 +726,26 @@ impl MeridianVault {
     }
 
     /// Replace the yield adapter. The vault must have no shares outstanding
-    /// before calling this. Resets the adapter-share counter so the new adapter
-    /// starts at zero.
+    /// (`TOTAL_SH == 0`) *and* no position left at the old adapter
+    /// (`ADPT_SH == 0`) before calling this.
+    ///
+    /// Checking `TOTAL_SH` alone is not sufficient: the two counters can
+    /// desync (see `migrate_adapter`'s `NoAdapterPosition` doc), so a vault
+    /// that looks empty by `TOTAL_SH` can still have real value sitting at
+    /// the old adapter. Deliberately does *not* reset `ADPT_SH` to zero on
+    /// swap the way it used to -- doing so would destroy the only evidence
+    /// that a stranded position existed, and it is unnecessary: `ADPT_SH`
+    /// is only ever nonzero here in a genuinely-empty vault as a result of a
+    /// bug, and clearing it would delete the observability that bug needs
+    /// to be diagnosed, not fix it. In the normal case (both counters
+    /// already zero) leaving `ADPT_SH` alone is a no-op.
     pub fn set_adapter(env: Env, new_adapter: Address) -> Result<(), ContractError> {
         Self::require_admin(&env)?;
-        if Self::get_total_shares(env.clone()) > 0 {
+        let total_adapter_shares: i128 = env.storage().instance().get(&ADPT_SH).unwrap_or(0);
+        if Self::get_total_shares(env.clone()) > 0 || total_adapter_shares > 0 {
             return Err(ContractError::AdapterSwapUnsafe);
         }
         env.storage().instance().set(&ADAPTER, &new_adapter);
-        env.storage().instance().set(&ADPT_SH, &0_i128);
         Ok(())
     }
 
@@ -682,7 +870,9 @@ impl MeridianVault {
         }
 
         env.storage().instance().set(&ADAPTER, &new_adapter);
-        env.storage().instance().set(&ADPT_SH, &new_shares);
+        env.storage()
+            .instance()
+            .set(&ADPT_SH, &new_adapter_client.total_shares());
         Ok(())
     }
 
@@ -792,6 +982,98 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // MockMusdc: a minimal stand-in for the real `meridian-musdc-token`
+    // crate (#578), used instead of a genuine cross-crate dependency for
+    // the same reason `MockAdapter` below stands in for a real adapter
+    // crate rather than depending on one: the vault crate shouldn't need to
+    // depend on musdc-token for production code, and its own test suite
+    // (packages/contracts/musdc-token/src/lib.rs) already exercises the
+    // real token's transfer/callback plumbing end-to-end against its own
+    // local mock vault. What matters here is exercising *this* crate's
+    // `on_transfer` logic against a token that genuinely calls it the same
+    // way the real one does: a direct, self-authorized cross-contract call
+    // made after balances have moved, carrying both parties'
+    // pre-transfer balances. `TokenClient`/`MusdcAdminClient` dispatch by
+    // function name and argument encoding, not by any Rust trait
+    // implementation, so this needs no `#[contractclient]`-generated trait
+    // on its side to be a valid call target for either. Wrapped in its own
+    // module for the same reason as `cached_mock`/`lossy_mock` below:
+    // contractimpl-generated helper items (e.g. `__initialize`) aren't
+    // namespaced by type, so a second contract with a same-named method
+    // (`initialize`) at this module level would collide.
+    // -----------------------------------------------------------------------
+    mod mock_musdc {
+        use super::*;
+
+        const MM_ADMIN: Symbol = symbol_short!("MM_ADMIN");
+
+        #[contracttype]
+        #[derive(Clone)]
+        pub enum MockMusdcKey {
+            Balance(Address),
+        }
+
+        #[contract]
+        pub struct MockMusdc;
+
+        #[contractimpl]
+        impl MockMusdc {
+            pub fn initialize(env: Env, admin: Address) {
+                env.storage().instance().set(&MM_ADMIN, &admin);
+            }
+
+            pub fn mint(env: Env, to: Address, amount: i128) {
+                let balance = Self::read_balance(&env, &to);
+                Self::write_balance(&env, &to, balance + amount);
+            }
+
+            pub fn balance(env: Env, id: Address) -> i128 {
+                Self::read_balance(&env, &id)
+            }
+
+            pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+                from.require_auth();
+                if from == to {
+                    return;
+                }
+                let from_balance = Self::read_balance(&env, &from);
+                let to_balance = Self::read_balance(&env, &to);
+                Self::write_balance(&env, &from, from_balance - amount);
+                Self::write_balance(&env, &to, to_balance + amount);
+
+                let admin: Address = env.storage().instance().get(&MM_ADMIN).unwrap();
+                MeridianVaultClient::new(&env, &admin).on_transfer(
+                    &from,
+                    &to,
+                    &amount,
+                    &from_balance,
+                    &to_balance,
+                );
+            }
+
+            pub fn burn(env: Env, from: Address, amount: i128) {
+                from.require_auth();
+                let balance = Self::read_balance(&env, &from);
+                Self::write_balance(&env, &from, balance - amount);
+            }
+
+            fn read_balance(env: &Env, id: &Address) -> i128 {
+                env.storage()
+                    .persistent()
+                    .get(&MockMusdcKey::Balance(id.clone()))
+                    .unwrap_or(0)
+            }
+
+            fn write_balance(env: &Env, id: &Address, amount: i128) {
+                env.storage()
+                    .persistent()
+                    .set(&MockMusdcKey::Balance(id.clone()), &amount);
+            }
+        }
+    }
+    use mock_musdc::{MockMusdc, MockMusdcClient};
+
+    // -----------------------------------------------------------------------
     // MockAdapter: proportional yield-bearing adapter used in vault tests.
     // Tracks shares 1:1 with deposited USDC. Proportional withdrawal means
     // any USDC minted directly to the adapter (simulating yield) is included
@@ -829,6 +1111,10 @@ mod tests {
             let usdc: Address =
                 get_or_not_initialized(&env, env.storage().instance().get(&MA_USDC));
             mock_total_assets(&env, &usdc)
+        }
+
+        pub fn total_shares(env: Env) -> i128 {
+            env.storage().instance().get(&MA_SH).unwrap_or(0)
         }
 
         pub fn refresh(_env: Env) {
@@ -890,6 +1176,10 @@ mod tests {
                 mock_total_assets(&env, &usdc)
             }
 
+            pub fn total_shares(env: Env) -> i128 {
+                env.storage().instance().get(&LA_SH).unwrap_or(0)
+            }
+
             pub fn refresh(_env: Env) {
                 // No-op: LossyMockAdapter already prices total_assets() live.
             }
@@ -939,6 +1229,10 @@ mod tests {
                 let usdc: Address =
                     get_or_not_initialized(&env, env.storage().instance().get(&ZS_USDC));
                 mock_total_assets(&env, &usdc)
+            }
+
+            pub fn total_shares(env: Env) -> i128 {
+                env.storage().instance().get(&ZS_SH).unwrap_or(0)
             }
 
             pub fn refresh(_env: Env) {
@@ -1016,6 +1310,10 @@ mod tests {
                 env.storage().instance().get(&CM_TOTAL).unwrap_or(0)
             }
 
+            pub fn total_shares(env: Env) -> i128 {
+                env.storage().instance().get(&CM_SH).unwrap_or(0)
+            }
+
             pub fn refresh(env: Env) {
                 // USDC address is always set in initialize(), so this is safe.
                 let usdc: Address =
@@ -1048,18 +1346,17 @@ mod tests {
         let usdc_id = env
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
-        let musdc_id = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
 
         let adapter_id = env.register(CachedMockAdapter, ());
         CachedMockAdapterClient::new(&env, &adapter_id).initialize(&usdc_id);
 
         let vault_id = env.register(MeridianVault, ());
         let vault = MeridianVaultClient::new(&env, &vault_id);
-        vault.initialize(&admin, &usdc_id, &musdc_id, &adapter_id);
 
-        StellarAssetClient::new(&env, &musdc_id).set_admin(&vault_id);
+        let musdc_id = env.register(MockMusdc, ());
+        MockMusdcClient::new(&env, &musdc_id).initialize(&vault_id);
+
+        vault.initialize(&admin, &usdc_id, &musdc_id, &adapter_id);
 
         StellarAssetClient::new(&env, &usdc_id).mint(&user, &10_000_000_000_i128);
 
@@ -1082,22 +1379,33 @@ mod tests {
         let admin = Address::generate(&env);
         let user = Address::generate(&env);
 
-        // Deploy mock USDC and mUSDC tokens.
+        // Deploy mock USDC and mUSDC. mUSDC here is MockMusdc (#578), a
+        // minimal stand-in for the real `meridian-musdc-token` crate — see
+        // its doc comment above for why this crate uses a local mock
+        // instead of a genuine cross-crate dependency. It calls
+        // `on_transfer` the same way the real token does: a direct,
+        // self-authorized cross-contract call after balances move.
         let usdc_id = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-        let musdc_id = env
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
 
         let adapter_id = env.register(MockAdapter, ());
         MockAdapterClient::new(&env, &adapter_id).initialize(&usdc_id);
 
+        // The vault must exist before mUSDC can be initialized with it as
+        // admin (mUSDC's admin is a contract address, not an account, so it
+        // can never itself sign an `initialize()` call the way a deploy
+        // script's admin key signs the vault's own `initialize()` — this
+        // mirrors the vault's own initialize() being callable by anyone
+        // before the real admin gets to it, see
+        // apps/docs/operations/testnet-deployment.md).
         let vault_id = env.register(MeridianVault, ());
         let vault = MeridianVaultClient::new(&env, &vault_id);
-        vault.initialize(&admin, &usdc_id, &musdc_id, &adapter_id);
 
-        StellarAssetClient::new(&env, &musdc_id).set_admin(&vault_id);
+        let musdc_id = env.register(MockMusdc, ());
+        MockMusdcClient::new(&env, &musdc_id).initialize(&vault_id);
+
+        vault.initialize(&admin, &usdc_id, &musdc_id, &adapter_id);
 
         // Fund the user with 1000 USDC (7 decimal places: 1000 * 10^7).
         StellarAssetClient::new(&env, &usdc_id).mint(&user, &10_000_000_000_i128);
@@ -1436,9 +1744,13 @@ mod tests {
 
     #[test]
     fn withdrawing_after_a_partial_transfer_out_retires_basis_against_what_is_held() {
-        // The proportional retirement divides by the caller's live balance,
-        // so a holder who transferred half away still retires exactly the
-        // basis for the shares they actually burn.
+        // #578: a partial transfer-out now moves half the sender's
+        // principal to the receiver at the moment of transfer (it no longer
+        // "stays behind" the way it did when mUSDC was a plain SAC with no
+        // transfer hook). The proportional retirement on withdraw() then
+        // divides by the caller's live balance, so a holder who transferred
+        // half away and then withdraws half of what remains retires exactly
+        // a quarter of the original basis.
         let (env, _admin, user, _usdc, musdc_id, _adapter, vault) = setup();
         let bob = Address::generate(&env);
 
@@ -1447,13 +1759,15 @@ mod tests {
         let shares = vault.get_position(&user);
         TokenClient::new(&env, &musdc_id).transfer(&user, &bob, &(shares / 2));
 
+        // Half the principal moved with half the shares.
+        assert_eq!(vault.get_principal(&user), amount / 2);
+
         let held = vault.get_position(&user);
         vault.withdraw(&user, &(held / 2), &0_i128);
 
-        // Half of what they held was burned, so half of the recorded basis
-        // is retired; the basis for the transferred shares stays behind,
-        // since nothing about the transfer told the vault it happened.
-        assert_eq!(vault.get_principal(&user), amount / 2);
+        // Half of what they held (post-transfer) was burned, so half of
+        // their remaining basis is retired.
+        assert_eq!(vault.get_principal(&user), amount / 4);
     }
 
     #[test]
@@ -1501,12 +1815,16 @@ mod tests {
     }
 
     #[test]
-    fn a_transfer_in_after_a_cleared_transfer_out_reports_no_stale_basis() {
-        // A read while the holder was at zero (get_principal/get_entry_time,
-        // as any position fetch would trigger) heals the stale record left
-        // behind by the transfer-out. A later, unrelated transfer-in must
-        // then find nothing left to inherit, not the basis/entry time of the
-        // position this address held and gave up earlier.
+    fn a_full_round_trip_transfer_restores_the_original_principal_and_entry_time() {
+        // Before #578, "staleness" was a real risk here: the vault had no
+        // way to move basis on a transfer, so a `user -> bob -> user`
+        // round trip needed the zero-position self-heal to keep `user`
+        // from re-inheriting a leftover record from the position they gave
+        // up. Now that on_transfer genuinely carries Principal/Entry
+        // through every hop, the round trip is correct by construction: bob
+        // received user's exact basis and entry time on the first transfer,
+        // and transferring 100% of it back hands both back to user exactly
+        // as they were, not zero and not stale.
         let (env, _admin, user, _usdc, musdc_id, _adapter, vault) = setup();
         let bob = Address::generate(&env);
 
@@ -1515,57 +1833,114 @@ mod tests {
         let shares = vault.get_position(&user);
         TokenClient::new(&env, &musdc_id).transfer(&user, &bob, &shares);
 
-        // Any read while the position is at zero heals the stale record.
+        // A full transfer-out clears the sender's own records...
         assert_eq!(vault.get_principal(&user), 0);
         assert_eq!(vault.get_entry_time(&user), 0);
+        // ...while the receiver inherits them outright.
+        assert_eq!(vault.get_principal(&bob), 100_0000000_i128);
+        assert_eq!(vault.get_entry_time(&bob), 1_000);
 
-        // bob transfers the same shares straight back to `user`, unrelated
-        // to the position `user` held and gave up earlier.
+        // bob transfers the same shares straight back to `user`.
         env.ledger().with_mut(|li| li.timestamp = 2_000);
         TokenClient::new(&env, &musdc_id).transfer(&bob, &user, &shares);
 
         assert_eq!(vault.get_position(&user), shares);
-        assert_eq!(vault.get_principal(&user), 0);
-        assert_eq!(vault.get_entry_time(&user), 0);
+        assert_eq!(vault.get_principal(&user), 100_0000000_i128);
+        // Entry time travels with the position, not with the clock: it's
+        // still 1_000, the timestamp of user's original deposit, not 2_000
+        // when this second transfer happened.
+        assert_eq!(vault.get_entry_time(&user), 1_000);
     }
 
     #[test]
-    fn a_transferred_in_position_reports_no_recorded_basis() {
-        // Documented consequence of mUSDC being a Stellar Asset Contract:
-        // its `transfer` is the built-in implementation, so there is no hook
-        // the vault could use to move a sender's cost basis to the receiver.
-        // The receiver can withdraw in full; only the yield figure derived
-        // from basis is unknown, and reads as "nothing recorded".
+    fn a_transferred_in_position_inherits_the_senders_principal_and_entry_time() {
+        // #578: mUSDC is now a custom SEP-41 token whose transfer calls back
+        // into the vault, so a receiver with no prior position inherits the
+        // sender's cost basis and entry time outright, instead of the old
+        // honest-`0` degradation from back when mUSDC was a plain SAC with
+        // no hook for the vault to observe a transfer at all.
         let (env, _admin, user, _usdc, musdc_id, _adapter, vault) = setup();
         let bob = Address::generate(&env);
 
+        env.ledger().with_mut(|li| li.timestamp = 12_345);
         vault.deposit(&user, &100_0000000_i128);
         let shares = vault.get_position(&user);
         TokenClient::new(&env, &musdc_id).transfer(&user, &bob, &shares);
 
         assert_eq!(vault.get_position(&bob), shares);
-        assert_eq!(vault.get_principal(&bob), 0);
-        assert_eq!(vault.get_entry_time(&bob), 0);
+        assert_eq!(vault.get_principal(&bob), 100_0000000_i128);
+        assert_eq!(vault.get_entry_time(&bob), 12_345);
     }
 
     #[test]
-    fn depositing_on_top_of_a_transferred_in_position_stamps_an_entry_time() {
-        // The entry stamp keys off whether the address has ever deposited,
-        // not off its share balance: an address holding transferred mUSDC has
-        // never deposited, so its first deposit is a real entry.
+    fn depositing_on_top_of_a_transferred_in_position_is_a_topup_not_a_fresh_entry() {
+        // #578 changes this from before: an address holding transferred
+        // mUSDC used to have never deposited (no Entry/Principal record at
+        // all), so its first deposit was a real, fresh entry. Now
+        // `on_transfer` records both for the receiver too, so a deposit on
+        // top of a transferred-in position is correctly a top-up — it keeps
+        // the inherited entry time and adds to the inherited principal,
+        // exactly like topping up a directly-deposited position (see
+        // `topup_keeps_original_entry_time`/`topup_accumulates_principal`).
         let (env, _admin, user, usdc_id, musdc_id, _adapter, vault) = setup();
         let bob = Address::generate(&env);
 
+        env.ledger().with_mut(|li| li.timestamp = 1_000);
         vault.deposit(&user, &100_0000000_i128);
         let shares = vault.get_position(&user);
         TokenClient::new(&env, &musdc_id).transfer(&user, &bob, &shares);
+        assert_eq!(vault.get_entry_time(&bob), 1_000);
+        assert_eq!(vault.get_principal(&bob), 100_0000000_i128);
 
         StellarAssetClient::new(&env, &usdc_id).mint(&bob, &10_0000000_i128);
         env.ledger().with_mut(|li| li.timestamp = 99_999);
         vault.deposit(&bob, &10_0000000_i128);
 
-        assert_eq!(vault.get_entry_time(&bob), 99_999);
-        assert_eq!(vault.get_principal(&bob), 10_0000000_i128);
+        assert_eq!(vault.get_entry_time(&bob), 1_000);
+        assert_eq!(vault.get_principal(&bob), 110_0000000_i128);
+    }
+
+    #[test]
+    fn transferring_into_an_existing_position_weight_averages_entry_time() {
+        // #578: when the receiver already holds a position, entry time is a
+        // principal-weighted average of their existing entry time and the
+        // sender's, rather than either being overwritten or left untouched
+        // — a large incoming transfer should meaningfully pull entry_time
+        // forward, not get swallowed by the receiver's own original stamp.
+        let (env, _admin, user, usdc_id, musdc_id, _adapter, vault) = setup();
+        let carol = Address::generate(&env);
+
+        env.ledger().with_mut(|li| li.timestamp = 1_000);
+        vault.deposit(&user, &100_0000000_i128);
+
+        StellarAssetClient::new(&env, &usdc_id).mint(&carol, &50_0000000_i128);
+        env.ledger().with_mut(|li| li.timestamp = 5_000);
+        vault.deposit(&carol, &50_0000000_i128);
+
+        let shares = vault.get_position(&user);
+        TokenClient::new(&env, &musdc_id).transfer(&user, &carol, &shares);
+
+        // total_principal = 50_0000000 (carol) + 100_0000000 (user) = 150_0000000
+        // weighted_entry = (5_000*50_0000000 + 1_000*100_0000000) / 150_0000000 = 2_333
+        assert_eq!(vault.get_principal(&carol), 150_0000000_i128);
+        assert_eq!(vault.get_entry_time(&carol), 2_333);
+    }
+
+    #[test]
+    fn on_transfer_rejects_a_caller_that_is_not_the_configured_musdc_contract() {
+        // on_transfer's whole security model rests on requiring the
+        // *direct* caller to be the configured mUSDC contract (see its doc
+        // comment) — verified here by calling it directly, bypassing mUSDC
+        // entirely, with mocking turned off so nothing can auto-authorize
+        // it the way `setup()`'s `mock_all_auths()` otherwise would.
+        let (env, _admin, user, _usdc, _musdc, _adapter, vault) = setup();
+        let bob = Address::generate(&env);
+        vault.deposit(&user, &100_0000000_i128);
+
+        env.set_auths(&[]);
+        let result =
+            vault.try_on_transfer(&user, &bob, &10_0000000_i128, &100_0000000_i128, &0_i128);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1658,6 +2033,79 @@ mod tests {
     }
 
     #[test]
+    fn set_adapter_succeeds_after_genuine_full_withdrawal() {
+        // Regression guard for issue #561, negative direction: prove the
+        // tightened guard doesn't regress the legitimate case of a vault
+        // that reaches empty organically. deposit()+withdraw() keep TOTAL_SH
+        // and ADPT_SH in lockstep -- a full withdrawal burns
+        // shares * ADPT_SH / TOTAL_SH with shares == TOTAL_SH, which divides
+        // evenly, so both counters land on exactly zero together. set_adapter
+        // must still succeed in that real, organically-reached empty state.
+        let (env, _admin, user, usdc, musdc, _adapter, vault) = setup();
+        let amount = 100_0000000_i128;
+        vault.deposit(&user, &amount);
+
+        let musdc_balance = TokenClient::new(&env, &musdc).balance(&user);
+        vault.withdraw(&user, &musdc_balance, &0_i128);
+
+        assert_eq!(vault.get_total_shares(), 0);
+        assert_eq!(
+            env.as_contract(&vault.address, || env
+                .storage()
+                .instance()
+                .get::<_, i128>(&ADPT_SH)
+                .unwrap_or(0)),
+            0
+        );
+
+        let new_adapter_id = env.register(MockAdapter, ());
+        MockAdapterClient::new(&env, &new_adapter_id).initialize(&usdc);
+        let result = vault.try_set_adapter(&new_adapter_id);
+        assert_eq!(result, Ok(Ok(())));
+        assert_eq!(vault.get_adapter(), new_adapter_id);
+    }
+
+    #[test]
+    fn set_adapter_fails_when_adapter_shares_outstanding_despite_zero_total_shares() {
+        // Regression test for issue #561: set_adapter's AdapterSwapUnsafe
+        // guard checked only TOTAL_SH, not ADPT_SH. The two counters can
+        // desync in production (the rounding-drift path referenced in the
+        // issue); reproducing that drift organically isn't the point of
+        // this test, so -- like accrue_returns_typed_error_when_pool_key_is_unset
+        // above -- ADPT_SH is set directly to construct the exact
+        // TOTAL_SH == 0, ADPT_SH > 0 precondition the issue describes, and
+        // the real set_adapter entry point is exercised against it.
+        let (env, _admin, _user, usdc, _musdc, _adapter, vault) = setup();
+        assert_eq!(vault.get_total_shares(), 0);
+
+        let stranded_adapter_shares = 42_000_000_i128;
+        env.as_contract(&vault.address, || {
+            env.storage()
+                .instance()
+                .set(&ADPT_SH, &stranded_adapter_shares);
+        });
+
+        let new_adapter_id = env.register(MockAdapter, ());
+        MockAdapterClient::new(&env, &new_adapter_id).initialize(&usdc);
+        let original_adapter = vault.get_adapter();
+
+        let result = vault.try_set_adapter(&new_adapter_id);
+        assert_eq!(result, Err(Ok(ContractError::AdapterSwapUnsafe)));
+
+        // The swap must not have gone through, and -- just as importantly --
+        // the evidence of the stranded position must not have been erased.
+        assert_eq!(vault.get_adapter(), original_adapter);
+        assert_eq!(
+            env.as_contract(&vault.address, || env
+                .storage()
+                .instance()
+                .get::<_, i128>(&ADPT_SH)
+                .unwrap_or(0)),
+            stranded_adapter_shares
+        );
+    }
+
+    #[test]
     fn migrate_adapter_moves_position_and_preserves_bookkeeping() {
         let (env, _admin, user, usdc, _musdc, _adapter, vault) = setup();
         let amount = 100_0000000_i128;
@@ -1720,6 +2168,49 @@ mod tests {
         // the vault isn't left with ADPT_SH desynced from TOTAL_SH.
         assert_eq!(vault.get_adapter(), adapter);
         assert_eq!(vault.get_total_assets(), amount);
+    }
+
+    #[test]
+    fn deposit_reconciles_drifted_adpt_sh_to_the_adapter_s_real_balance() {
+        // Regression test for issue #556: ADPT_SH used to be maintained by
+        // locally incrementing/decrementing an estimate, which could drift
+        // from the adapter's real share balance over many operations. This
+        // fix instead reconciles ADPT_SH to adapter_client.total_shares()
+        // after every deposit/withdraw. Simulate a vault that already has
+        // pre-existing drift (e.g. from rounding accumulated before this fix
+        // shipped) by directly corrupting the stored counter, then prove the
+        // very next deposit snaps it back to ground truth instead of
+        // compounding on the wrong value.
+        let (env, _admin, user, _usdc, _musdc, adapter, vault) = setup();
+        let amount = 100_0000000_i128;
+        vault.deposit(&user, &amount);
+
+        // Corrupt the stored counter so it disagrees with the adapter's real
+        // balance (which is `amount`, per MockAdapter's deposit()).
+        let drifted_value = amount + 42_0000000_i128;
+        env.as_contract(&vault.address, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "ADPT_SH"), &drifted_value);
+        });
+
+        // A second deposit should reconcile ADPT_SH to the adapter's real
+        // total_shares(), not to drifted_value + this deposit's shares.
+        let second_amount = 50_0000000_i128;
+        vault.deposit(&user, &second_amount);
+
+        let adapter_real_shares = MockAdapterClient::new(&env, &adapter).total_shares();
+        let stored_adpt_sh: i128 = env.as_contract(&vault.address, || {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "ADPT_SH"))
+                .unwrap()
+        });
+        assert_eq!(
+            stored_adpt_sh, adapter_real_shares,
+            "ADPT_SH must reconcile to the adapter's real balance, not remain drifted"
+        );
+        assert_eq!(stored_adpt_sh, amount + second_amount);
     }
 
     #[test]
@@ -2103,15 +2594,15 @@ mod tests {
             let usdc_id = env
                 .register_stellar_asset_contract_v2(admin.clone())
                 .address();
-            let musdc_id = env
-                .register_stellar_asset_contract_v2(admin.clone())
-                .address();
             let adapter_id = env.register(MockAdapter, ());
             MockAdapterClient::new(&env, &adapter_id).initialize(&usdc_id);
             let vault_id = env.register(MeridianVault, ());
             let vault = MeridianVaultClient::new(&env, &vault_id);
+
+            let musdc_id = env.register(MockMusdc, ());
+            MockMusdcClient::new(&env, &musdc_id).initialize(&vault_id);
+
             vault.initialize(&admin, &usdc_id, &musdc_id, &adapter_id);
-            StellarAssetClient::new(&env, &musdc_id).set_admin(&vault_id);
 
             StellarAssetClient::new(&env, &usdc_id).mint(&user_a, &10_000_000_i128);
             StellarAssetClient::new(&env, &usdc_id).mint(&user_b, &10_000_i128);
